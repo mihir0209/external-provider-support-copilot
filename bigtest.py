@@ -132,83 +132,289 @@ def show():
         }
     })
 
+def strip_text_values(data):
+    """Recursively replaces all string values in a JSON object with an empty string."""
+    if isinstance(data, dict):
+        return {key: strip_text_values(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [strip_text_values(item) for item in data]
+    elif isinstance(data, str):
+        return ""  # Replace string with empty
+    else:
+        return data  # Keep numbers, booleans, etc.
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
     req = request.get_json(force=True)
-    print(f"[API] POST /v1/chat/completions: {req}")
+    
+    # Create a text-free version of the request for structural analysis
+    req_structure = strip_text_values(req)
+    print("[API] POST /v1/chat/completions (Structure Only):")
+    print(json.dumps(req_structure))
 
     headers = {
         "Authorization": f"Bearer {A4F_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    # Collect and reconstruct answer as before:
-    try:
-        with requests.post(
-            CHAT_COMPLETION_ENDPOINT,
-            headers=headers,
-            json=req,
-            timeout=60,
-            stream=True
-        ) as r:
-            content_text = ""
-            role = "assistant"
-            model = None
-            chunk_id = None
-            created = int(time.time())
-            usage = None
-            for line in r.iter_lines():
-                if not line:
-                    continue
-                text = line.decode()
-                if text.strip() == "data: [DONE]":
-                    break
-                if not text.startswith("data:"):
-                    continue
-                data = text[5:].strip()
-                chunk = json.loads(data)
-                model = chunk.get("model", model)
-                chunk_id = chunk.get("id", chunk_id)
-                created = chunk.get("created", created)
-                usage = chunk.get("usage", usage)
-                delta = chunk["choices"][0]["delta"]
-                if "content" in delta and delta["content"]:
-                    content_text += delta["content"]
-                if "role" in delta and delta["role"]:
-                    role = delta["role"]
-
-            # Streaming is needed as by default Copilot Chat needs stream to be true, so we simulate that:
-            def fake_streaming():
-                out_chunk = {
-                    "id": chunk_id or "dummy-id",
+    # Check if tools are present - if so, disable streaming in the outgoing request
+    has_tools = bool(req.get("tools"))
+    if has_tools:
+        print("[API] Tools detected - disabling streaming for provider request")
+        # Create a copy of the request without streaming for tools mode
+        provider_req = req.copy()
+        provider_req["stream"] = False
+        if "stream_options" in provider_req:
+            del provider_req["stream_options"]
+        
+        # Handle tools mode (agent mode) - non-streaming request, fake streaming response
+        try:
+            print("[API] Making non-streaming request for tools mode")
+            r = requests.post(
+                CHAT_COMPLETION_ENDPOINT,
+                headers=headers,
+                json=provider_req,
+                timeout=60
+            )
+            
+            if r.status_code != 200:
+                print(f"[API] Provider API Error: {r.status_code} - {r.text}")
+                def error_stream():
+                    error_response = {
+                        "id": f"error-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.get("model", "provider-model"),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": f"Error: Provider API Error {r.status_code}"
+                            },
+                            "finish_reason": "error"
+                        }]
+                    }
+                    yield f"data: {json.dumps(error_response)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), r.status_code
+            
+            # Process the complete response
+            try:
+                response_data = r.json()
+                print(f"[API] Received complete response for tools mode")
+            except:
+                print(f"[API] Failed to parse JSON response: {r.text[:200]}")
+                response_data = {"choices": []}
+                
+            # Convert complete response to streaming format
+            def fake_stream_response():
+                # Check if we have valid choices
+                if not response_data.get("choices") or len(response_data["choices"]) == 0:
+                    print("[API] No choices in response - creating default response")
+                    default_response = {
+                        "id": f"chatcmpl-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.get("model", "provider-model"),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": "I apologize, but I'm unable to provide a response at this moment. Please try again."
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f"data: {json.dumps(default_response)}\n\n"
+                else:
+                    choice = response_data["choices"][0]
+                    content = ""
+                    
+                    # Extract content from the response
+                    if "message" in choice and choice["message"].get("content"):
+                        content = choice["message"]["content"]
+                    elif "text" in choice:
+                        content = choice["text"]
+                    
+                    # Handle tool calls if present
+                    tool_calls = None
+                    if "message" in choice and choice["message"].get("tool_calls"):
+                        tool_calls = choice["message"]["tool_calls"]
+                    
+                    # Send role first if we have content or tool calls
+                    if content or tool_calls:
+                        role_chunk = {
+                            "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
+                            "object": "chat.completion.chunk",
+                            "created": response_data.get("created", int(time.time())),
+                            "model": response_data.get("model", req.get("model", "provider-model")),
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(role_chunk)}\n\n"
+                    
+                    # Send content if available
+                    if content:
+                        content_chunk = {
+                            "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
+                            "object": "chat.completion.chunk",
+                            "created": response_data.get("created", int(time.time())),
+                            "model": response_data.get("model", req.get("model", "provider-model")),
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": content},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
+                    
+                    # Send tool calls if available
+                    if tool_calls:
+                        tool_chunk = {
+                            "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
+                            "object": "chat.completion.chunk",
+                            "created": response_data.get("created", int(time.time())),
+                            "model": response_data.get("model", req.get("model", "provider-model")),
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": tool_calls},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(tool_chunk)}\n\n"
+                
+                # Final chunk with finish_reason
+                final_chunk = {
+                    "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
                     "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model or "provider-model",
+                    "created": response_data.get("created", int(time.time())),
+                    "model": response_data.get("model", req.get("model", "provider-model")),
                     "choices": [{
                         "index": 0,
-                        "delta": {
-                            "role": role,
-                            "content": content_text
-                        },
+                        "delta": {},
                         "finish_reason": "stop"
                     }]
                 }
-                yield f"data: {json.dumps(out_chunk)}\n\n"
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                
+                # Send usage information if requested
+                if req.get("stream_options", {}).get("include_usage", False):
+                    usage_data = response_data.get("usage", {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    })
+                    usage_chunk = {
+                        "id": f"chatcmpl-usage-{int(time.time())}",
+                        "object": "chat.completion.chunk.usage",
+                        "created": int(time.time()),
+                        "model": req.get("model") or "provider-model",
+                        "usage": usage_data
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
+                
                 yield "data: [DONE]\n\n"
+            
+            print("[API] Returning fake SSE streaming to Copilot for tools mode.")
+            return Response(stream_with_context(fake_stream_response()), mimetype="text/event-stream")
+            
+        except Exception as e:
+            print(f"[API] Exception in tools mode: {e}")
+            def error_stream():
+                error_response = {
+                    "id": f"error-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.get("model", "provider-model"),
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "content": f"Error: {str(e)}"
+                        },
+                        "finish_reason": "error"
+                    }]
+                }
+                yield f"data: {json.dumps(error_response)}\n\n"
+                yield "data: [DONE]\n\n"
+            return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), 500
+    
+    else:
+        # No tools - use the original working ask mode format
+        print("[API] No tools detected - using original ask mode format")
+        
+        # Collect and reconstruct answer as in the original working version:
+        try:
+            with requests.post(
+                CHAT_COMPLETION_ENDPOINT,
+                headers=headers,
+                json=req,
+                timeout=60,
+                stream=True
+            ) as r:
+                content_text = ""
+                role = "assistant"
+                model = None
+                chunk_id = None
+                created = int(time.time())
+                usage = None
+                
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    text = line.decode()
+                    if text.strip() == "data: [DONE]":
+                        break
+                    if not text.startswith("data:"):
+                        continue
+                    data = text[5:].strip()
+                    try:
+                        chunk = json.loads(data)
+                        model = chunk.get("model", model)
+                        chunk_id = chunk.get("id", chunk_id)
+                        created = chunk.get("created", created)
+                        usage = chunk.get("usage", usage)
+                        
+                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                            delta = chunk["choices"][0]["delta"]
+                            if "content" in delta and delta["content"]:
+                                content_text += delta["content"]
+                            if "role" in delta and delta["role"]:
+                                role = delta["role"]
+                    except Exception as chunk_error:
+                        print(f"[API] Error parsing chunk: {chunk_error}, data: {data[:100]}")
+                        continue
 
-            print("[API] Returning SSE streaming to Copilot.")
-            return Response(stream_with_context(fake_streaming()), mimetype="text/event-stream")
+                # Streaming is needed as by default Copilot Chat needs stream to be true, so we simulate that:
+                def fake_streaming():
+                    out_chunk = {
+                        "id": chunk_id or f"chatcmpl-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model or req.get("model", "provider-model"),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": role,
+                                "content": content_text
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f"data: {json.dumps(out_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
 
-    except Exception as e:
-        print(f"[API] Exception forwarding request: {e}")
-        def error_stream():
-            err = {"error": f"Exception: {str(e)}"}
-            yield f"data: {json.dumps(err)}\n\n"
-            yield "data: [DONE]\n\n"
-        return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), 500
+                print("[API] Returning SSE streaming to Copilot (ask mode).")
+                return Response(stream_with_context(fake_streaming()), mimetype="text/event-stream")
 
-
+        except Exception as e:
+            print(f"[API] Exception forwarding request in ask mode: {e}")
+            def error_stream():
+                err = {"error": f"Exception: {str(e)}"}
+                yield f"data: {json.dumps(err)}\n\n"
+                yield "data: [DONE]\n\n"
+            return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), 500
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
