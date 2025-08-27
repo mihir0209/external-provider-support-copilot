@@ -34,7 +34,7 @@ Streaming support was added to mimic the behavior of native AI chat interfaces, 
 - Ensure the `.env` file contains your API key.
 - Run the server:
   ```bash
-  python bigtest.py
+  python server.py
   ```
   Connect your client (e.g., Ollama or Copilot) to the server's endpoints for chat or model info.
 Notes

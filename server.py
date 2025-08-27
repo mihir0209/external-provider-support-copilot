@@ -6,6 +6,9 @@ app = Flask(__name__)
 import os
 import dotenv
 
+# Import our function executor
+from function_executor import parse_function_calls_from_text, execute_function_call, clean_content_for_display
+
 dotenv.load_dotenv()
 
 A4F_API_KEY = os.getenv("A4F_API_KEY") # Configure the API key in .env directly or just paste the key in quotes here.
@@ -88,6 +91,43 @@ class AIEngine:
             else:
                 return {"error": str(e)}, 500
 
+def strip_text_values(data):
+    """Recursively replaces all string values in a JSON object with an empty string."""
+    if isinstance(data, dict):
+        return {key: strip_text_values(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [strip_text_values(item) for item in data]
+    elif isinstance(data, str):
+        return ""  # Replace string with empty
+    else:
+        return data  # Keep numbers, booleans, etc.
+
+def process_function_calls_in_response(content):
+    """Process any function calls found in the response content and execute them"""
+    function_calls = parse_function_calls_from_text(content)
+    function_results = []
+    cleaned_content = content
+    
+    if function_calls:
+        print(f"[API] Found {len(function_calls)} function calls to execute")
+        
+        # Clean the content for display (remove thinking and tool calls)
+        cleaned_content = clean_content_for_display(content)
+        
+        for func_call in function_calls:
+            func_name = func_call["name"]
+            params = func_call["parameters"]
+            print(f"[API] Executing function: {func_name} with params: {list(params.keys())}")
+            
+            result = execute_function_call(func_name, params)
+            function_results.append({
+                "name": func_name,
+                "result": result
+            })
+            print(f"[API] Function {func_name} result: {result}")
+    
+    return function_results, cleaned_content
+
 engine = AIEngine(A4F_API_KEY, CHAT_COMPLETION_ENDPOINT)
 
 @app.after_request
@@ -132,17 +172,6 @@ def show():
         }
     })
 
-def strip_text_values(data):
-    """Recursively replaces all string values in a JSON object with an empty string."""
-    if isinstance(data, dict):
-        return {key: strip_text_values(value) for key, value in data.items()}
-    elif isinstance(data, list):
-        return [strip_text_values(item) for item in data]
-    elif isinstance(data, str):
-        return ""  # Replace string with empty
-    else:
-        return data  # Keep numbers, booleans, etc.
-
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
     req = request.get_json(force=True)
@@ -167,7 +196,7 @@ def chat_completions():
         if "stream_options" in provider_req:
             del provider_req["stream_options"]
         
-        # Handle tools mode (agent mode) - non-streaming request, fake streaming response
+        # Handle tools mode (agent mode) - non-streaming request, execute functions, fake streaming response
         try:
             print("[API] Making non-streaming request for tools mode")
             r = requests.post(
@@ -204,7 +233,19 @@ def chat_completions():
             except:
                 print(f"[API] Failed to parse JSON response: {r.text[:200]}")
                 response_data = {"choices": []}
-                
+            
+            # Extract content and execute any function calls
+            original_content = ""
+            if response_data.get("choices") and len(response_data["choices"]) > 0:
+                choice = response_data["choices"][0]
+                if "message" in choice and choice["message"].get("content"):
+                    original_content = choice["message"]["content"]
+                elif "text" in choice:
+                    original_content = choice["text"]
+            
+            # Execute function calls if found
+            function_results, cleaned_content = process_function_calls_in_response(original_content)
+            
             # Convert complete response to streaming format
             def fake_stream_response():
                 # Check if we have valid choices
@@ -231,14 +272,26 @@ def chat_completions():
                     
                     # Extract content from the response
                     if "message" in choice and choice["message"].get("content"):
-                        content = choice["message"]["content"]
+                        content = cleaned_content or choice["message"]["content"]
                     elif "text" in choice:
-                        content = choice["text"]
+                        content = cleaned_content or choice["text"]
                     
                     # Handle tool calls if present
                     tool_calls = None
                     if "message" in choice and choice["message"].get("tool_calls"):
                         tool_calls = choice["message"]["tool_calls"]
+                    elif function_results:
+                        # Convert our function results to tool_calls format
+                        tool_calls = []
+                        for i, func_result in enumerate(function_results):
+                            tool_calls.append({
+                                "id": f"call_{int(time.time())}_{i}",
+                                "type": "function",
+                                "function": {
+                                    "name": func_result["name"],
+                                    "arguments": json.dumps(func_result["result"])
+                                }
+                            })
                     
                     # Send role first if we have content or tool calls
                     if content or tool_calls:
@@ -317,11 +370,12 @@ def chat_completions():
                 
                 yield "data: [DONE]\n\n"
             
-            print("[API] Returning fake SSE streaming to Copilot for tools mode.")
+            print("[API] Returning fake SSE streaming to Copilot for tools mode with function execution.")
             return Response(stream_with_context(fake_stream_response()), mimetype="text/event-stream")
             
         except Exception as e:
             print(f"[API] Exception in tools mode: {e}")
+            error_message = str(e)  # Capture the error message
             def error_stream():
                 error_response = {
                     "id": f"error-{int(time.time())}",
@@ -331,7 +385,7 @@ def chat_completions():
                     "choices": [{
                         "index": 0,
                         "delta": {
-                            "content": f"Error: {str(e)}"
+                            "content": f"Error: {error_message}"
                         },
                         "finish_reason": "error"
                     }]
@@ -410,8 +464,9 @@ def chat_completions():
 
         except Exception as e:
             print(f"[API] Exception forwarding request in ask mode: {e}")
+            error_message = str(e)  # Capture the error message
             def error_stream():
-                err = {"error": f"Exception: {str(e)}"}
+                err = {"error": f"Exception: {error_message}"}
                 yield f"data: {json.dumps(err)}\n\n"
                 yield "data: [DONE]\n\n"
             return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), 500
@@ -424,5 +479,5 @@ def catch_all(path):
     return jsonify({"error": "Not implemented"}), 404
 
 if __name__ == '__main__':
-    print("== Custom AI Backend Server for Copilot BYOK starting on localhost:11434 ==")
+    print("== Custom AI Backend Server for Copilot BYOK with Function Execution starting on localhost:11434 ==")
     app.run(host="localhost", port=11434)
