@@ -10,8 +10,11 @@ def parse_function_calls_from_text(content):
     function_calls = []
     
     try:
+        # Remove <think> blocks to ignore reasoning
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        
         # Check if this is a reasoning model response with <think> tags
-        is_reasoning_model = '<think>' in content or '<tool_call>' in content
+        is_reasoning_model = '<tool_call>' in content
         
         if is_reasoning_model:
             print("[PARSER] Detected reasoning model response")
@@ -90,6 +93,26 @@ def parse_reasoning_model_calls(content):
         # Pattern 2: Look for code blocks that suggest file operations
         if not function_calls:
             function_calls.extend(extract_implicit_function_calls(content))
+        
+        # Pattern 3: JSON tool calls in code blocks
+        code_block_pattern = r'```json\s*\n(.*?)\n```'
+        code_matches = re.finditer(code_block_pattern, content, re.DOTALL)
+        
+        for match in code_matches:
+            json_text = match.group(1).strip()
+            try:
+                tool_call = json.loads(json_text)
+                if "tool" in tool_call:
+                    func_name = tool_call["tool"]
+                    params = {k: v for k, v in tool_call.items() if k != "tool"}
+                    func_name = map_tool_name(func_name)
+                    function_calls.append({
+                        "name": func_name,
+                        "parameters": params
+                    })
+                    print(f"[PARSER] Parsed tool call from code block: {func_name}")
+            except json.JSONDecodeError as e:
+                print(f"[PARSER] Failed to parse JSON from code block: {e}")
             
     except Exception as e:
         print(f"[PARSER] Error parsing reasoning model calls: {e}")
@@ -127,7 +150,6 @@ def extract_parameters_manually(args_text):
 def map_tool_name(tool_name):
     """Map non-existent tool names to real ones"""
     tool_mapping = {
-        "insert_edit_into_file": "replace_string_in_file",
         "edit_file": "replace_string_in_file",
         "write_file": "create_file",
         "save_file": "create_file",
@@ -172,6 +194,12 @@ def clean_content_for_display(content):
     
     # Remove tool call JSON
     content = re.sub(r'\{"name":\s*"[^"]+",\s*"arguments":\s*\{[^}]*\}\}', '', content)
+    
+    # Remove code blocks with JSON
+    content = re.sub(r'```json\s*\n.*?\n```', '', content, flags=re.DOTALL)
+    
+    # Remove XML tool calls
+    content = re.sub(r'<invoke name="[^"]+">.*?</invoke>', '', content, flags=re.DOTALL)
     
     # Clean up extra whitespace
     content = re.sub(r'\n\s*\n', '\n\n', content)
@@ -249,11 +277,11 @@ def execute_insert_edit_into_file(params):
 
 def execute_create_file(params):
     """Create a file with given content"""
-    file_path = params.get("filePath")
+    file_path = params.get("filePath") or params.get("filename")
     content = params.get("content", "")
     
     if not file_path:
-        return {"error": "filePath parameter required"}
+        return {"error": "filePath (or filename) parameter required"}
     
     try:
         # Create directory if it doesn't exist (only if file is in a subdirectory)
@@ -299,10 +327,10 @@ def execute_run_in_terminal(params):
 
 def execute_read_file(params):
     """Read file contents"""
-    file_path = params.get("filePath")
+    file_path = params.get("filePath") or params.get("filename")
     
     if not file_path:
-        return {"error": "filePath parameter required"}
+        return {"error": "filePath (or filename) parameter required"}
     
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -313,12 +341,12 @@ def execute_read_file(params):
 
 def execute_replace_string_in_file(params):
     """Replace string in file"""
-    file_path = params.get("filePath")
+    file_path = params.get("filePath") or params.get("filename")
     old_string = params.get("oldString")
     new_string = params.get("newString")
     
     if not all([file_path, old_string is not None, new_string is not None]):
-        return {"error": "filePath, oldString, and newString parameters required"}
+        return {"error": "filePath (or filename), oldString, and newString parameters required"}
     
     try:
         with open(file_path, 'r', encoding='utf-8') as f:

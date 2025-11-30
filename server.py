@@ -2,94 +2,33 @@ import time
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 import json
-app = Flask(__name__)
+import sys
 import os
 import dotenv
+
+# Add AI_Engine to path
+# Use insert(0) to ensure local modules (like config.py) take precedence over installed packages
+sys.path.insert(0, os.path.join(os.getcwd(), "AI_Engine"))
+
+try:
+    from ai_engine import AI_engine
+    from model_cache import shared_model_cache
+except ImportError as e:
+    print(f"Failed to import AI Engine: {e}")
+    sys.exit(1)
+
+app = Flask(__name__)
 
 # Import our function executor
 from function_executor import parse_function_calls_from_text, execute_function_call, clean_content_for_display
 
 dotenv.load_dotenv()
 
-A4F_API_KEY = os.getenv("A4F_API_KEY") # Configure the API key in .env directly or just paste the key in quotes here.
-MODEL_LIST_ENDPOINT = "https://api.a4f.co/v1/models"
-CHAT_COMPLETION_ENDPOINT = "https://api.a4f.co/v1/chat/completions"
+# Initialize AI Engine
+engine = AI_engine(verbose=True)
+shared_model_cache.load_cache()
 
-class AIEngine:
-    MAX_RETRIES = 3
-    BASE_BACKOFF = 5
-    COOLDOWN_SECONDS = 10
-    _api_call_count = 0
-    _last_cooldown_time = 0
-
-    def __init__(self, api_key, chat_endpoint):
-        self.api_key = api_key
-        self.chat_endpoint = chat_endpoint
-
-    def _maybe_cooldown(self):
-        self.__class__._api_call_count += 1
-        if self.__class__._api_call_count % 5 == 0:
-            now = time.time()
-            if now - self.__class__._last_cooldown_time > 1:
-                print(f"[AIEngine] ⏳ cooldown: {self.COOLDOWN_SECONDS}s after 5 requests...")
-                for i in range(self.COOLDOWN_SECONDS, 0, -1):
-                    print(f"[AIEngine]   ...{i}s remaining", end='\r', flush=True)
-                    time.sleep(1)
-                print("[AIEngine]   ...0s remaining          ")
-                self.__class__._last_cooldown_time = time.time()
-
-    def list_models(self):
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            r = requests.get(MODEL_LIST_ENDPOINT, headers=headers, timeout=15)
-            print(f"[AIEngine] Model list: {r.status_code} {r.text[:200]}")
-            if r.status_code != 200:
-                return []
-            model_data = r.json()
-            return model_data.get("data", [])
-        except Exception as e:
-            print(f"[AIEngine] Model listing exception: {e}")
-            return []
-
-    def relay_completion(self, payload, stream=False):
-        self._maybe_cooldown()
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        try:
-            if stream:
-                with requests.post(self.chat_endpoint, headers=headers, json=payload, stream=True, timeout=80) as r:
-                    def gen():
-                        for line in r.iter_lines():
-                            if line:
-                                # Proper SSE chunk relay.
-                                text = line.decode()
-                                if not text.startswith("data: "):
-                                    text = "data: " + text
-                                yield text + "\n\n"
-                    return gen, r.status_code
-            else:
-                r = requests.post(self.chat_endpoint, headers=headers, json=payload, timeout=60)
-                print(f"[AIEngine][relay_completion] status: {r.status_code} body: {r.text[:200]}")
-                return r.json(), r.status_code
-        except Exception as e:
-            print(f"[AIEngine] relay_completion exception: {e}")
-            if stream:
-                def gen_error():
-                    import json
-                    err = {
-                        "error": {"message": str(e)},
-                        "object": "error"
-                    }
-                    yield f"data: {json.dumps(err)}\n\n"
-                    yield "data: [DONE]\n\n"
-                return gen_error, 500
-            else:
-                return {"error": str(e)}, 500
+# AIEngine class removed as we are using the imported AI_engine module
 
 def strip_text_values(data):
     """Recursively replaces all string values in a JSON object with an empty string."""
@@ -128,7 +67,7 @@ def process_function_calls_in_response(content):
     
     return function_results, cleaned_content
 
-engine = AIEngine(A4F_API_KEY, CHAT_COMPLETION_ENDPOINT)
+# engine = AIEngine(A4F_API_KEY, CHAT_COMPLETION_ENDPOINT) # Removed
 
 @app.after_request
 def add_headers(response):
@@ -145,14 +84,29 @@ def version():
 @app.route('/api/tags', methods=['GET'])
 def tags():
     print("[API] GET /api/tags")
-    models = engine.list_models()
+    # Use shared_model_cache to get models
+    if shared_model_cache.is_cache_valid():
+        models = shared_model_cache.get_models()
+    else:
+        # If cache is invalid, we might want to trigger a refresh or return empty
+        # For now, let's try to return what we have or empty
+        models = shared_model_cache.get_models()
+        
     formatted = []
     for m in models:
+        # Handle both string (new cache) and dict (old cache/fallback) formats
+        if isinstance(m, str):
+            model_id = m
+            modified_at = "2025-08-01T00:00:00Z"
+        else:
+            model_id = m.get("id", "unknown")
+            modified_at = str(m.get("created", "2025-08-01T00:00:00Z"))
+            
         formatted.append({
-            "name": m.get("id", "unknown"),
-            "model": m.get("id", "unknown"),
-            "modified_at": m.get("created", "2025-08-01T00:00:00Z"),
-            "size": m.get("size", 0)
+            "name": model_id,
+            "model": model_id,
+            "modified_at": modified_at,
+            "size": 0
         })
     return jsonify({"models": formatted})
 
@@ -176,300 +130,102 @@ def show():
 def chat_completions():
     req = request.get_json(force=True)
     
-    # Create a text-free version of the request for structural analysis
-    req_structure = strip_text_values(req)
-    print("[API] POST /v1/chat/completions (Structure Only):")
-    print(json.dumps(req_structure))
-
-    headers = {
-        "Authorization": f"Bearer {A4F_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    # Check if tools are present - if so, disable streaming in the outgoing request
-    has_tools = bool(req.get("tools"))
-    if has_tools:
-        print("[API] Tools detected - disabling streaming for provider request")
-        # Create a copy of the request without streaming for tools mode
-        provider_req = req.copy()
-        provider_req["stream"] = False
-        if "stream_options" in provider_req:
-            del provider_req["stream_options"]
-        
-        # Handle tools mode (agent mode) - non-streaming request, execute functions, fake streaming response
-        try:
-            print("[API] Making non-streaming request for tools mode")
-            r = requests.post(
-                CHAT_COMPLETION_ENDPOINT,
-                headers=headers,
-                json=provider_req,
-                timeout=60
-            )
-            
-            if r.status_code != 200:
-                print(f"[API] Provider API Error: {r.status_code} - {r.text}")
-                def error_stream():
-                    error_response = {
-                        "id": f"error-{int(time.time())}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": req.get("model", "provider-model"),
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "content": f"Error: Provider API Error {r.status_code}"
-                            },
-                            "finish_reason": "error"
-                        }]
-                    }
-                    yield f"data: {json.dumps(error_response)}\n\n"
-                    yield "data: [DONE]\n\n"
-                return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), r.status_code
-            
-            # Process the complete response
-            try:
-                response_data = r.json()
-                print(f"[API] Received complete response for tools mode")
-            except:
-                print(f"[API] Failed to parse JSON response: {r.text[:200]}")
-                response_data = {"choices": []}
-            
-            # Extract content and execute any function calls
-            original_content = ""
-            if response_data.get("choices") and len(response_data["choices"]) > 0:
-                choice = response_data["choices"][0]
-                if "message" in choice and choice["message"].get("content"):
-                    original_content = choice["message"]["content"]
-                elif "text" in choice:
-                    original_content = choice["text"]
-            
-            # Execute function calls if found
-            function_results, cleaned_content = process_function_calls_in_response(original_content)
-            
-            # Convert complete response to streaming format
-            def fake_stream_response():
-                # Check if we have valid choices
-                if not response_data.get("choices") or len(response_data["choices"]) == 0:
-                    print("[API] No choices in response - creating default response")
-                    default_response = {
-                        "id": f"chatcmpl-{int(time.time())}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": req.get("model", "provider-model"),
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": "I apologize, but I'm unable to provide a response at this moment. Please try again."
-                            },
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    yield f"data: {json.dumps(default_response)}\n\n"
-                else:
-                    choice = response_data["choices"][0]
-                    content = ""
-                    
-                    # Extract content from the response
-                    if "message" in choice and choice["message"].get("content"):
-                        content = cleaned_content or choice["message"]["content"]
-                    elif "text" in choice:
-                        content = cleaned_content or choice["text"]
-                    
-                    # Handle tool calls if present
-                    tool_calls = None
-                    if "message" in choice and choice["message"].get("tool_calls"):
-                        tool_calls = choice["message"]["tool_calls"]
-                    elif function_results:
-                        # Convert our function results to tool_calls format
-                        tool_calls = []
-                        for i, func_result in enumerate(function_results):
-                            tool_calls.append({
-                                "id": f"call_{int(time.time())}_{i}",
-                                "type": "function",
-                                "function": {
-                                    "name": func_result["name"],
-                                    "arguments": json.dumps(func_result["result"])
-                                }
-                            })
-                    
-                    # Send role first if we have content or tool calls
-                    if content or tool_calls:
-                        role_chunk = {
-                            "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
-                            "object": "chat.completion.chunk",
-                            "created": response_data.get("created", int(time.time())),
-                            "model": response_data.get("model", req.get("model", "provider-model")),
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"role": "assistant"},
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(role_chunk)}\n\n"
-                    
-                    # Send content if available
-                    if content:
-                        content_chunk = {
-                            "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
-                            "object": "chat.completion.chunk",
-                            "created": response_data.get("created", int(time.time())),
-                            "model": response_data.get("model", req.get("model", "provider-model")),
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": content},
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(content_chunk)}\n\n"
-                    
-                    # Send tool calls if available
-                    if tool_calls:
-                        tool_chunk = {
-                            "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
-                            "object": "chat.completion.chunk",
-                            "created": response_data.get("created", int(time.time())),
-                            "model": response_data.get("model", req.get("model", "provider-model")),
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"tool_calls": tool_calls},
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(tool_chunk)}\n\n"
-                
-                # Final chunk with finish_reason
-                final_chunk = {
-                    "id": response_data.get("id", f"chatcmpl-{int(time.time())}"),
-                    "object": "chat.completion.chunk",
-                    "created": response_data.get("created", int(time.time())),
-                    "model": response_data.get("model", req.get("model", "provider-model")),
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                
-                # Send usage information if requested
-                if req.get("stream_options", {}).get("include_usage", False):
-                    usage_data = response_data.get("usage", {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0
-                    })
-                    usage_chunk = {
-                        "id": f"chatcmpl-usage-{int(time.time())}",
-                        "object": "chat.completion.chunk.usage",
-                        "created": int(time.time()),
-                        "model": req.get("model") or "provider-model",
-                        "usage": usage_data
-                    }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
-                
-                yield "data: [DONE]\n\n"
-            
-            print("[API] Returning fake SSE streaming to Copilot for tools mode with function execution.")
-            return Response(stream_with_context(fake_stream_response()), mimetype="text/event-stream")
-            
-        except Exception as e:
-            print(f"[API] Exception in tools mode: {e}")
-            error_message = str(e)  # Capture the error message
-            def error_stream():
-                error_response = {
-                    "id": f"error-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": req.get("model", "provider-model"),
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "content": f"Error: {error_message}"
-                        },
-                        "finish_reason": "error"
-                    }]
-                }
-                yield f"data: {json.dumps(error_response)}\n\n"
-                yield "data: [DONE]\n\n"
-            return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), 500
+    # Log request structure
+    with open('logs/last_copilot_request.json', 'w') as f:
+        json.dump(req, f, indent=2)
     
-    else:
-        # No tools - use the original working ask mode format
-        print("[API] No tools detected - using original ask mode format")
+    messages = req.get("messages", [])
+    model = req.get("model")
+    
+    print(f"[API] Requesting completion for model: {model}")
+
+    # Call AI Engine
+    # We use autodecide=True to let the engine pick the best provider if needed, 
+    # or it will use the specific model if found.
+    result = engine.chat_completion(
+        messages=messages,
+        model=model,
+        autodecide=True
+    )
+    
+    if not result.success:
+        print(f"[API] AI Engine failed: {result.error_message}")
+        return jsonify({"error": result.error_message}), 500
         
-        # Collect and reconstruct answer as in the original working version:
-        try:
-            with requests.post(
-                CHAT_COMPLETION_ENDPOINT,
-                headers=headers,
-                json=req,
-                timeout=60,
-                stream=True
-            ) as r:
-                content_text = ""
-                role = "assistant"
-                model = None
-                chunk_id = None
-                created = int(time.time())
-                usage = None
-                
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    text = line.decode()
-                    if text.strip() == "data: [DONE]":
-                        break
-                    if not text.startswith("data:"):
-                        continue
-                    data = text[5:].strip()
-                    try:
-                        chunk = json.loads(data)
-                        model = chunk.get("model", model)
-                        chunk_id = chunk.get("id", chunk_id)
-                        created = chunk.get("created", created)
-                        usage = chunk.get("usage", usage)
-                        
-                        if "choices" in chunk and len(chunk["choices"]) > 0:
-                            delta = chunk["choices"][0]["delta"]
-                            if "content" in delta and delta["content"]:
-                                content_text += delta["content"]
-                            if "role" in delta and delta["role"]:
-                                role = delta["role"]
-                    except Exception as chunk_error:
-                        print(f"[API] Error parsing chunk: {chunk_error}, data: {data[:100]}")
-                        continue
+    print(f"[API] AI Engine success. Provider: {result.provider_used}, Model: {result.model_used}")
+    
+    # Save response for debugging
+    with open('logs/last_model_response.json', 'w') as f:
+        # Create a dict representation of the result
+        response_debug = {
+            "content": result.content,
+            "provider": result.provider_used,
+            "model": result.model_used,
+            "raw_response": result.raw_response
+        }
+        json.dump(response_debug, f, indent=2)
 
-                # Streaming is needed as by default Copilot Chat needs stream to be true, so we simulate that:
-                def fake_streaming():
-                    out_chunk = {
-                        "id": chunk_id or f"chatcmpl-{int(time.time())}",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model or req.get("model", "provider-model"),
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "role": role,
-                                "content": content_text
-                            },
-                            "finish_reason": "stop"
-                        }]
+    # Process content for function calls
+    # This handles parsing <think> tags (stripping them) and finding tool calls
+    function_results, cleaned_content = process_function_calls_in_response(result.content)
+    
+    # Generate fake streaming response
+    def fake_stream_response():
+        completion_id = f"chatcmpl-{int(time.time())}"
+        created = int(time.time())
+        
+        # 1. Send Role
+        yield f"data: {json.dumps({
+            'id': completion_id,
+            'object': 'chat.completion.chunk',
+            'created': created,
+            'model': result.model_used,
+            'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]
+        })}\n\n"
+        
+        # 2. Send Content (if any)
+        if cleaned_content:
+            yield f"data: {json.dumps({
+                'id': completion_id,
+                'object': 'chat.completion.chunk',
+                'created': created,
+                'model': result.model_used,
+                'choices': [{'index': 0, 'delta': {'content': cleaned_content}, 'finish_reason': None}]
+            })}\n\n"
+            
+        # 3. Send Tool Calls (if any)
+        if function_results:
+            tool_calls = []
+            for i, func_result in enumerate(function_results):
+                tool_calls.append({
+                    "id": f"call_{int(time.time())}_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": func_result["name"],
+                        "arguments": json.dumps(func_result["result"])
                     }
-                    yield f"data: {json.dumps(out_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
+                })
+            
+            yield f"data: {json.dumps({
+                'id': completion_id,
+                'object': 'chat.completion.chunk',
+                'created': created,
+                'model': result.model_used,
+                'choices': [{'index': 0, 'delta': {'tool_calls': tool_calls}, 'finish_reason': None}]
+            })}\n\n"
+            
+        # 4. Finish
+        yield f"data: {json.dumps({
+            'id': completion_id,
+            'object': 'chat.completion.chunk',
+            'created': created,
+            'model': result.model_used,
+            'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]
+        })}\n\n"
+        
+        yield "data: [DONE]\n\n"
 
-                print("[API] Returning SSE streaming to Copilot (ask mode).")
-                return Response(stream_with_context(fake_streaming()), mimetype="text/event-stream")
-
-        except Exception as e:
-            print(f"[API] Exception forwarding request in ask mode: {e}")
-            error_message = str(e)  # Capture the error message
-            def error_stream():
-                err = {"error": f"Exception: {error_message}"}
-                yield f"data: {json.dumps(err)}\n\n"
-                yield "data: [DONE]\n\n"
-            return Response(stream_with_context(error_stream()), mimetype="text/event-stream"), 500
+    return Response(stream_with_context(fake_stream_response()), mimetype="text/event-stream")
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
